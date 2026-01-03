@@ -11,6 +11,22 @@ case "${1:-}" in
     ;;
 esac
 
+require_cmd() {
+  command -v "$1" > /dev/null 2>&1
+}
+
+require_test_deps() {
+  local cmd
+  for cmd in find sort mktemp; do
+    if ! require_cmd "$cmd"; then
+      echo "missing required command: $cmd" >&2
+      exit 1
+    fi
+  done
+}
+
+require_test_deps
+
 if command -v prove > /dev/null 2>&1; then
   args=()
   "$VERBOSE" && args+=("-v")

@@ -457,6 +457,20 @@ command_exists() {
   command -v "$1" > /dev/null 2>&1
 }
 
+require_cmd() {
+  local cmd=$1
+  if ! command_exists "$cmd"; then
+    err "Missing required command: $cmd"
+  fi
+}
+
+require_runtime_deps() {
+  local cmd
+  for cmd in find du sort awk tail rm; do
+    require_cmd "$cmd"
+  done
+}
+
 cache_paths_for_cfg() {
   local cfg=$1
   [[ -d "$cfg" ]] || return 0
@@ -1654,6 +1668,7 @@ parse_args() {
 
 main() {
   parse_args "$@"
+  require_runtime_deps
 
   if [[ ${#EXT_DIRS[@]} -eq 0 ]]; then
     EXT_DIRS=("${DEFAULT_EXT_DIRS[@]}")
