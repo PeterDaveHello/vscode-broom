@@ -1,0 +1,1686 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: GPL-3.0-or-later
+set -uo pipefail
+IFS=$'\n\t'
+
+TARGET="all"
+ACTION="analyze"
+TARGET_SET=false
+ACTION_SET=false
+EXECUTE=false
+PRUNE_UNINSTALLED=false
+INCLUDE_WS_STORAGE=false
+INCLUDE_GLOBAL_STORAGE=false
+EXT_FLAG_USED=false
+CACHE_FLAG_USED=false
+HOST_FLAG_USED=false
+VERBOSE=false
+
+EXT_DIRS=()
+CONFIG_DIRS=()
+HOST_DIRS=()
+TARGET_PATH_FOUND=false
+DETECTED_ROOTS=()
+DETECTED_VARIANTS=()
+
+STALE_EXT_COUNT=0
+STALE_EXT_BYTES=0
+STALE_HOST_COUNT=0
+STALE_HOST_BYTES=0
+EXT_USED_BYTES=0
+CACHE_USED_BYTES=0
+HOST_USED_BYTES=0
+CACHE_RECLAIM_BYTES=0
+EXT_EXISTING_COUNT=0
+CACHE_EXISTING_COUNT=0
+HOST_EXISTING_COUNT=0
+PRINT_GAP=false
+
+DEFAULT_ROOTS=(
+  "$HOME/.vscode"
+  "$HOME/.vscode-insiders"
+  "$HOME/.vscode-oss"
+  "$HOME/.vscode-server"
+  "$HOME/.vscode-server-insiders"
+)
+
+variant_label() {
+  local root=$1
+  case "$root" in
+    */cli)
+      printf 'VS Code Server'
+      ;;
+    */cli/)
+      printf 'VS Code Server'
+      ;;
+    */.vscode-server-insiders*)
+      printf 'VS Code Server Insiders'
+      ;;
+    */.vscode-server*)
+      printf 'VS Code Server'
+      ;;
+    */.vscode-insiders*)
+      printf 'VS Code Insiders'
+      ;;
+    */.vscode-oss*)
+      printf 'VSCodium/OSS'
+      ;;
+    */.vscode*)
+      printf 'VS Code'
+      ;;
+    *)
+      printf '%s' "$root"
+      ;;
+  esac
+}
+
+variant_label_from_config_base() {
+  local base=$1
+  case "$base" in
+    */com.visualstudio.code/config/Code)
+      printf 'VS Code'
+      ;;
+    */Code)
+      printf 'VS Code'
+      ;;
+    */Code\ -\ Insiders)
+      printf 'VS Code Insiders'
+      ;;
+    */VSCodium)
+      printf 'VSCodium/OSS'
+      ;;
+    *)
+      printf ''
+      ;;
+  esac
+}
+
+desktop_cli_candidates_for_root() {
+  local root=$1
+  case "$root" in
+    "$HOME/.vscode-insiders")
+      printf '%s\n' "code-insiders"
+      ;;
+    "$HOME/.vscode-oss")
+      printf '%s\n' "codium"
+      printf '%s\n' "code-oss"
+      ;;
+    *)
+      printf '%s\n' "code"
+      ;;
+  esac
+}
+
+desktop_cli_required_for_root() {
+  local root=$1
+  case "$root" in
+    "$HOME/.vscode" | "$HOME/.vscode-insiders" | "$HOME/.vscode-oss")
+      return 1
+      ;;
+    *)
+      return 0
+      ;;
+  esac
+}
+
+DEFAULT_CONFIG_BASES=(
+  "$HOME/.config/Code"
+  "$HOME/.config/Code - Insiders"
+  "$HOME/.config/VSCodium"
+  "$HOME/.var/app/com.visualstudio.code/config/Code"
+)
+
+DEFAULT_EXT_DIRS=()
+DEFAULT_CONFIG_DIRS=()
+DEFAULT_HOST_DIRS=()
+
+build_default_paths() {
+  # Collect roots from explicit candidates; no globs
+  local -a roots=()
+  declare -A seen=()
+
+  local match
+  for match in "${DEFAULT_ROOTS[@]}"; do
+    [[ -d "$match" ]] || continue
+    if [[ -z ${seen[$match]:-} ]]; then
+      roots+=("$match")
+      seen[$match]=1
+      DETECTED_ROOTS+=("$match")
+      DETECTED_VARIANTS+=("$(variant_label "$match")")
+    fi
+  done
+
+  # If nothing found, keep the list empty rather than inventing paths
+
+  if [[ ${#DEFAULT_EXT_DIRS[@]} -eq 0 ]]; then
+    local root
+    for root in "${roots[@]}"; do
+      case "$root" in
+        */cli*) ;; # cli roots are for host/server assets only
+        *)
+          DEFAULT_EXT_DIRS+=("$root/extensions")
+          ;;
+      esac
+    done
+  fi
+
+  if [[ ${#DEFAULT_CONFIG_DIRS[@]} -eq 0 ]]; then
+    local base
+    for base in "${DEFAULT_CONFIG_BASES[@]}"; do
+      [[ -d "$base" ]] || continue
+      DEFAULT_CONFIG_DIRS+=("$base")
+      local label
+      label=$(variant_label_from_config_base "$base")
+      [[ -n "$label" ]] && DETECTED_VARIANTS+=("$label")
+    done
+
+    local root
+    for root in "${roots[@]}"; do
+      case "$root" in
+        */cli*) ;; # no user data under cli roots
+        *.vscode-server*)
+          [[ -d "$root/data" ]] && DEFAULT_CONFIG_DIRS+=("$root/data")
+          ;;
+      esac
+    done
+  fi
+
+  if [[ ${#DEFAULT_HOST_DIRS[@]} -eq 0 ]]; then
+    local root
+    for root in "${roots[@]}"; do
+      case "$root" in
+        *.vscode-server*)
+          DEFAULT_HOST_DIRS+=("$root")
+          [[ -d "$root/bin" ]] && DEFAULT_HOST_DIRS+=("$root/bin")
+          [[ -d "$root/cli/servers" ]] && DEFAULT_HOST_DIRS+=("$root/cli/servers")
+          ;;
+      esac
+    done
+  fi
+}
+
+build_default_paths
+
+log() {
+  printf '%s\n' "$*"
+}
+
+join_by() {
+  local delim=$1
+  shift
+  local first=1
+  local part
+  for part in "$@"; do
+    if ((first)); then
+      printf '%s' "$part"
+      first=0
+    else
+      printf '%s%s' "$delim" "$part"
+    fi
+  done
+}
+
+dedupe_ext_dirs() {
+  declare -A seen=()
+  local -a unique=()
+  local dir
+  for dir in "${EXT_DIRS[@]}"; do
+    if [[ -z ${seen[$dir]:-} ]]; then
+      unique+=("$dir")
+      seen[$dir]=1
+    fi
+  done
+  EXT_DIRS=("${unique[@]}")
+}
+
+dedupe_config_dirs() {
+  declare -A seen=()
+  local -a unique=()
+  local dir
+  for dir in "${CONFIG_DIRS[@]}"; do
+    if [[ -z ${seen[$dir]:-} ]]; then
+      unique+=("$dir")
+      seen[$dir]=1
+    fi
+  done
+  CONFIG_DIRS=("${unique[@]}")
+}
+
+dedupe_host_dirs() {
+  declare -A seen=()
+  local -a unique=()
+  local dir
+  for dir in "${HOST_DIRS[@]}"; do
+    if [[ -z ${seen[$dir]:-} ]]; then
+      unique+=("$dir")
+      seen[$dir]=1
+    fi
+  done
+  HOST_DIRS=("${unique[@]}")
+}
+
+print_missing() {
+  local always=false
+  if [[ "${1:-}" == "--always" ]]; then
+    always=true
+    shift
+  fi
+
+  local label=$1
+  shift
+  local -a items=("$@")
+  ((${#items[@]} == 0)) && return
+
+  if ! "$VERBOSE" && ! "$always"; then
+    return
+  fi
+
+  if "$PRINT_GAP"; then
+    echo
+  fi
+
+  local limit=10
+  local count=${#items[@]}
+  log "Missing ${label}:""${count:+" (total $count)"}"
+  local i=0
+  while ((i < count && i < limit)); do
+    printf '  - %s\n' "${items[$i]}"
+    ((i += 1))
+  done
+  if ((count > limit)); then
+    printf '    ... (+%d more)\n' "$((count - limit))"
+  fi
+
+  PRINT_GAP=true
+}
+
+human_path() {
+  local p=$1
+  case "$p" in
+    "$HOME"/*)
+      # shellcheck disable=SC2088
+      printf '~/%s' "${p#"$HOME/"}"
+      ;;
+    *)
+      printf '%s' "$p"
+      ;;
+  esac
+}
+
+warn() {
+  printf 'warning: %s\n' "$*" >&2
+}
+
+err() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+is_unsafe_root_path() {
+  local path=$1
+
+  local home_real
+  local home_parent
+  if ! home_real=$(cd "$HOME" 2> /dev/null && pwd -P); then
+    home_real=$HOME
+  fi
+  if ! home_parent=$(cd "$HOME/.." 2> /dev/null && pwd -P); then
+    home_parent=""
+  fi
+
+  case "$path" in
+    / | "$home_real" | "$home_real/" | "$home_real/.")
+      return 0
+      ;;
+  esac
+
+  if [[ -n "$home_parent" ]]; then
+    case "$path" in
+      "$home_parent" | "$home_parent/")
+        return 0
+        ;;
+    esac
+  fi
+
+  return 1
+}
+
+validate_user_dir() {
+  local flag=$1
+  local path=$2
+  if [[ ! -d "$path" ]]; then
+    err "$flag requires an existing directory: $path"
+  fi
+
+  local resolved
+  if ! resolved=$(cd "$path" 2> /dev/null && pwd -P); then
+    err "$flag requires an existing directory: $path"
+  fi
+
+  if is_unsafe_root_path "$resolved"; then
+    err "$flag refuses to use unsafe path: $path"
+  fi
+}
+
+is_under_root() {
+  local path=$1
+  local root=$2
+  [[ "$path" == "$root" || "$path" == "$root/"* ]]
+}
+
+validate_removal_paths() {
+  local -a bad=()
+  local path root
+  for path in "${PLAN_REMOVALS[@]}"; do
+    local ok=false
+    for root in "${EXT_DIRS[@]}" "${CONFIG_DIRS[@]}" "${HOST_DIRS[@]}"; do
+      if [[ -n "$root" ]] && is_under_root "$path" "$root"; then
+        ok=true
+        break
+      fi
+    done
+    if ! "$ok"; then
+      bad+=("$(human_path "$path")")
+    fi
+  done
+
+  if ((${#bad[@]})); then
+    err "Refusing to delete unexpected paths: $(join_by ', ' "${bad[@]}")"
+  fi
+}
+
+dir_size_bytes() {
+  local path=$1
+  if [[ -e "$path" ]]; then
+    local bytes
+    if bytes=$(du -sb "$path" 2> /dev/null | awk '{print $1}'); then
+      if [[ -n "$bytes" ]]; then
+        printf '%s' "$bytes"
+        return 0
+      fi
+    fi
+    "$VERBOSE" && warn "du failed for $(human_path "$path")"
+    printf '0'
+  else
+    printf '0'
+  fi
+}
+
+format_bytes() {
+  local bytes=$1
+  numfmt --to=iec --suffix=B "$bytes" 2> /dev/null || echo "${bytes}B"
+}
+
+usage() {
+  printf '%s\n' \
+    'Usage:' \
+    '  vscode-broom [target] [action] [options]' \
+    '  (defaults: target=all, action=analyze)' \
+    '' \
+    'Targets (default action: analyze)' \
+    '  extensions     Inspect/clean extension folders (keep newest version)' \
+    '  caches         Inspect/clean VS Code caches (CachedData, CachedExtensionVSIXs, logs)' \
+    '  hosts          Inspect/clean VS Code server builds (keep newest by mtime)' \
+    '  all            Run on extensions + caches + hosts' \
+    '' \
+    'Actions' \
+    '  analyze        Report disk usage' \
+    '  clean          Delete planned targets (requires --execute)' \
+    '' \
+    'Extension options' \
+    '  -p, --prune-uninstalled         Remove extension dirs not in "code --list-extensions"' \
+    '  -E, --extensions-path DIR       Add an extensions directory to scan' \
+    '' \
+    'Cache options' \
+    '  -w, --include-workspace-storage Include User/workspaceStorage' \
+    '  -g, --include-global-storage    Include User/globalStorage (settings/data)' \
+    '  -C, --config-path DIR           Add a config directory to scan (CachedData,...)' \
+    '' \
+    'Host options' \
+    '  -H, --host-path DIR             Add a server build directory to scan (e.g., ~/.vscode-server/bin)' \
+    '' \
+    'Global options' \
+    '  -x, --execute                   Execute deletions (otherwise dry-run)' \
+    '  -v, --verbose                   Show missing paths in detail' \
+    '  -h, --help                      Show this help' \
+    '' \
+    'Examples' \
+    '  vscode-broom' \
+    '  vscode-broom clean' \
+    '  vscode-broom clean --execute' \
+    '  vscode-broom hosts clean --execute' \
+    '  vscode-broom extensions clean --prune-uninstalled --execute' \
+    '  vscode-broom caches clean --execute'
+}
+
+command_exists() {
+  command -v "$1" > /dev/null 2>&1
+}
+
+cache_paths_for_cfg() {
+  local cfg=$1
+  [[ -d "$cfg" ]] || return 0
+
+  local -a paths=(
+    "$cfg/CachedData"
+    "$cfg/CachedExtensionVSIXs"
+    "$cfg/logs"
+  )
+
+  if "$INCLUDE_WS_STORAGE"; then
+    paths+=("$cfg/User/workspaceStorage")
+  fi
+
+  if "$INCLUDE_GLOBAL_STORAGE"; then
+    paths+=("$cfg/User/globalStorage")
+  fi
+
+  printf '%s\n' "${paths[@]}"
+}
+
+measure_path() {
+  local path=$1
+  local display
+  display=$(human_path "$path")
+  if [[ -e "$path" ]]; then
+    local bytes
+    bytes=$(dir_size_bytes "$path")
+    printf '  %-8s %s\n' "$(format_bytes "$bytes")" "$display"
+  else
+    printf '  %-8s %s\n' "(missing)" "$display"
+  fi
+}
+
+declare -a PLAN_REMOVALS=()
+declare -A PLAN_SEEN=()
+
+add_removal() {
+  local path=$1
+  if [[ -e "$path" && -z ${PLAN_SEEN[$path]:-} ]]; then
+    PLAN_SEEN[$path]=1
+    PLAN_REMOVALS+=("$path")
+  fi
+}
+
+declare -A INSTALLED_EXT=()
+declare -A PRUNE_SCOPE_LOADED=()
+declare -A PRUNE_SCOPE_SKIPPED=()
+declare -A PRUNE_SCOPE_REASON=()
+declare -A PRUNE_SCOPE_CLI=()
+
+prune_scope_for_dir() {
+  local dir=$1
+  case "$dir" in
+    "$HOME/.vscode-server-insiders"/* | "$HOME/.vscode-server-insiders")
+      printf 'server:%s' "$HOME/.vscode-server-insiders"
+      ;;
+    "$HOME/.vscode-server"/* | "$HOME/.vscode-server")
+      printf 'server:%s' "$HOME/.vscode-server"
+      ;;
+    "$HOME/.vscode-insiders"/* | "$HOME/.vscode-insiders")
+      printf 'desktop:%s' "$HOME/.vscode-insiders"
+      ;;
+    "$HOME/.vscode-oss"/* | "$HOME/.vscode-oss")
+      printf 'desktop:%s' "$HOME/.vscode-oss"
+      ;;
+    "$HOME/.vscode"/* | "$HOME/.vscode")
+      printf 'desktop:%s' "$HOME/.vscode"
+      ;;
+    *)
+      printf 'custom:%s' "$dir"
+      ;;
+  esac
+}
+
+prune_scope_label() {
+  local scope=$1
+  local kind=${scope%%:*}
+  local root=${scope#*:}
+  case "$kind" in
+    server | desktop)
+      printf '%s (%s)' "$(variant_label "$root")" "$(human_path "$root")"
+      ;;
+    custom)
+      printf 'Custom (%s)' "$(human_path "$root")"
+      ;;
+  esac
+}
+
+find_server_cli_in_base() {
+  local base=$1
+  [[ -d "$base" ]] || return 1
+
+  local line name candidate
+  while IFS= read -r line; do
+    name=${line#* }
+    for candidate in \
+      "$base/$name/bin/code" \
+      "$base/$name/server/bin/code" \
+      "$base/$name/bin/remote-cli/code"; do
+      [[ -x "$candidate" ]] && {
+        printf '%s' "$candidate"
+        return 0
+      }
+    done
+  done < <(find "$base" -maxdepth 1 -mindepth 1 -type d -printf '%T@ %f\n' | sort -nr)
+
+  return 1
+}
+
+server_code_cli_for_root() {
+  local root=$1
+  local candidate
+
+  candidate=$(find_server_cli_in_base "$root/cli/servers" || true)
+  [[ -n "$candidate" ]] && {
+    printf '%s' "$candidate"
+    return 0
+  }
+
+  candidate=$(find_server_cli_in_base "$root/bin" || true)
+  [[ -n "$candidate" ]] && {
+    printf '%s' "$candidate"
+    return 0
+  }
+
+  return 1
+}
+
+mark_prune_skip() {
+  local scope=$1 reason=$2
+  if [[ -z ${PRUNE_SCOPE_SKIPPED[$scope]:-} ]]; then
+    PRUNE_SCOPE_SKIPPED[$scope]=1
+    PRUNE_SCOPE_REASON[$scope]=$reason
+  fi
+}
+
+ensure_prune_scope_loaded() {
+  local scope=$1
+  [[ -n ${PRUNE_SCOPE_LOADED[$scope]:-} ]] && return 0
+  [[ -n ${PRUNE_SCOPE_SKIPPED[$scope]:-} ]] && return 1
+
+  local kind=${scope%%:*}
+  local root=${scope#*:}
+  local code_cli=""
+
+  if [[ "$kind" == "server" ]]; then
+    if ! code_cli=$(server_code_cli_for_root "$root"); then
+      mark_prune_skip "$scope" "server CLI not found under $(human_path "$root")"
+      return 1
+    fi
+
+    local output
+    if ! output=$("$code_cli" --list-extensions); then
+      mark_prune_skip "$scope" "server CLI failed: $(human_path "$code_cli")"
+      return 1
+    fi
+
+    PRUNE_SCOPE_CLI[$scope]=$(human_path "$code_cli")
+    local line
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      INSTALLED_EXT["$scope|$line"]=1
+    done < <(printf '%s\n' "$output")
+
+    PRUNE_SCOPE_LOADED[$scope]=1
+    return 0
+  fi
+
+  local -a candidates=()
+  mapfile -t candidates < <(desktop_cli_candidates_for_root "$root")
+  local -a available=()
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if command_exists "$candidate"; then
+      available+=("$candidate")
+    fi
+  done
+
+  if ((${#available[@]} == 0)); then
+    local label
+    label=$(join_by '/' "${candidates[@]}")
+    if desktop_cli_required_for_root "$root"; then
+      err "$label not found; --prune-uninstalled requires the VS Code CLI ('$label')"
+    fi
+    mark_prune_skip "$scope" "desktop CLI not found: $label"
+    return 1
+  fi
+
+  local -a outputs=()
+  local cli output
+  for cli in "${available[@]}"; do
+    if ! output=$("$cli" --list-extensions); then
+      if desktop_cli_required_for_root "$root"; then
+        err "$cli failed; --prune-uninstalled requires '$cli --list-extensions' to succeed"
+      fi
+      mark_prune_skip "$scope" "desktop CLI failed: $cli"
+      return 1
+    fi
+    outputs+=("$output")
+  done
+
+  PRUNE_SCOPE_CLI[$scope]=$(join_by ', ' "${available[@]}")
+  for output in "${outputs[@]}"; do
+    local line
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      INSTALLED_EXT["$scope|$line"]=1
+    done < <(printf '%s\n' "$output")
+  done
+
+  PRUNE_SCOPE_LOADED[$scope]=1
+  return 0
+}
+
+prepare_prune_scopes() {
+  if ! "$PRUNE_UNINSTALLED"; then
+    return
+  fi
+
+  local dir scope
+  for dir in "${EXT_DIRS[@]}"; do
+    scope=$(prune_scope_for_dir "$dir")
+    ensure_prune_scope_loaded "$scope" || true
+  done
+}
+
+report_prune_skips() {
+  if ! "$PRUNE_UNINSTALLED"; then
+    return
+  fi
+
+  local count=${#PRUNE_SCOPE_SKIPPED[@]}
+  if ((count == 0)); then
+    return
+  fi
+
+  local noun="scope"
+  ((count > 1)) && noun="scopes"
+  log "Prune-uninstalled skipped for $count $noun (use -v for details)."
+
+  if "$VERBOSE"; then
+    local scope
+    for scope in "${!PRUNE_SCOPE_SKIPPED[@]}"; do
+      log "  - $(prune_scope_label "$scope"): ${PRUNE_SCOPE_REASON[$scope]}"
+    done
+  fi
+}
+
+report_prune_cli_usage() {
+  if ! "$PRUNE_UNINSTALLED" || ! "$VERBOSE"; then
+    return
+  fi
+
+  if ((${#PRUNE_SCOPE_CLI[@]} == 0)); then
+    return
+  fi
+
+  if "$PRINT_GAP"; then
+    echo
+  fi
+
+  log "Prune-uninstalled CLI:"
+  local scope
+  for scope in "${!PRUNE_SCOPE_CLI[@]}"; do
+    log "  - $(prune_scope_label "$scope"): ${PRUNE_SCOPE_CLI[$scope]}"
+  done
+  PRINT_GAP=true
+}
+
+ver_gt() {
+  local a=$1 b=$2
+  [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -n1)" == "$a" && "$a" != "$b" ]]
+}
+
+parse_extension_entry() {
+  local entry=$1
+  local version=${entry##*-}
+  if [[ "$version" == "$entry" ]]; then
+    printf '%s\t\n' "$entry"
+    return
+  fi
+
+  if [[ $version =~ ^[0-9][0-9A-Za-z.+-]*$ ]]; then
+    local base=${entry%-"${version}"}
+    printf '%s\t%s\n' "$base" "$version"
+  else
+    printf '%s\t\n' "$entry"
+  fi
+}
+
+plan_extension_dir() {
+  local dir=$1
+  [[ -d "$dir" ]] || return 0
+  TARGET_PATH_FOUND=true
+
+  local prune_ok=false
+  local scope=""
+  if "$PRUNE_UNINSTALLED"; then
+    scope=$(prune_scope_for_dir "$dir")
+    if ensure_prune_scope_loaded "$scope"; then
+      prune_ok=true
+    fi
+  fi
+
+  declare -A latest_version=()
+
+  local entry base version current_latest
+  while IFS= read -r entry; do
+    read -r base version < <(parse_extension_entry "$entry")
+    [[ -n "$version" ]] || continue
+
+    current_latest=${latest_version[$base]:-}
+    if [[ -z "$current_latest" ]] || ver_gt "$version" "$current_latest"; then
+      latest_version[$base]=$version
+    fi
+  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+
+  while IFS= read -r entry; do
+    read -r base version < <(parse_extension_entry "$entry")
+    [[ -n "$version" ]] || continue
+
+    if "$PRUNE_UNINSTALLED" && "$prune_ok" && [[ -z ${INSTALLED_EXT["$scope|$base"]:-} ]]; then
+      add_removal "$dir/$entry"
+      continue
+    fi
+
+    if [[ "$version" != "${latest_version[$base]}" ]]; then
+      add_removal "$dir/$entry"
+    fi
+  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+}
+
+plan_config_dir() {
+  local cfg=$1
+  [[ -d "$cfg" ]] || return 0
+  TARGET_PATH_FOUND=true
+
+  local path
+  while IFS= read -r path; do
+    add_removal "$path"
+  done < <(cache_paths_for_cfg "$cfg")
+}
+
+is_server_root_dir() {
+  case "$1" in
+    "$HOME/.vscode-server" | "$HOME/.vscode-server/" | "$HOME/.vscode-server-insiders" | "$HOME/.vscode-server-insiders/")
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+host_entry_lines() {
+  local dir=$1
+  [[ -d "$dir" ]] || return 0
+
+  local line name
+  if is_server_root_dir "$dir"; then
+    while IFS= read -r line; do
+      name=${line#* }
+      case "$name" in
+        code-*)
+          printf '%s\n' "$line"
+          ;;
+      esac
+    done < <(find "$dir" -maxdepth 1 -mindepth 1 \( -type d -o -type f \) -printf '%T@ %f\n')
+    return 0
+  fi
+
+  while IFS= read -r line; do
+    name=${line#* }
+    case "$name" in
+      data | extensions | User | user-data | logs | tmp | workspaceStorage | globalStorage | cli | servers | bin)
+        continue
+        ;;
+    esac
+    printf '%s\n' "$line"
+  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%T@ %f\n')
+}
+
+newest_host_entry_name() {
+  local dir=$1
+  host_entry_lines "$dir" |
+    LC_ALL=C sort -k1,1nr -k2 |
+    head -n1 |
+    awk '{ sub(/^[^ ]+ /, ""); print }'
+}
+
+host_dir_has_entries() {
+  local dir=$1
+  [[ -d "$dir" ]] || return 1
+  while IFS= read -r _; do
+    return 0
+  done < <(host_entry_lines "$dir")
+  return 1
+}
+
+host_dir_used_bytes() {
+  local dir=$1
+  [[ -d "$dir" ]] || {
+    printf '0'
+    return 0
+  }
+
+  local total=0
+  local line name
+  while IFS= read -r line; do
+    name=${line#* }
+    total=$((total + $(dir_size_bytes "$dir/$name")))
+  done < <(host_entry_lines "$dir")
+
+  printf '%s' "$total"
+}
+
+plan_host_dir() {
+  local dir=$1
+  [[ -d "$dir" ]] || return 0
+  TARGET_PATH_FOUND=true
+
+  # Keep the newest (by mtime) install, remove older ones
+  local newest_name=""
+  newest_name=$(newest_host_entry_name "$dir")
+
+  [[ -n "$newest_name" ]] || return 0
+
+  local line name
+  while IFS= read -r line; do
+    name=${line#* }
+    [[ "$name" == "$newest_name" ]] && continue
+    add_removal "$dir/$name"
+  done < <(host_entry_lines "$dir")
+}
+
+count_stale_extensions_dir() {
+  local dir=$1
+  [[ -d "$dir" ]] || {
+    printf '0'
+    return 0
+  }
+
+  local prune_ok=false
+  local scope=""
+  if "$PRUNE_UNINSTALLED"; then
+    scope=$(prune_scope_for_dir "$dir")
+    if [[ -n ${PRUNE_SCOPE_LOADED[$scope]:-} ]]; then
+      prune_ok=true
+    fi
+  fi
+
+  declare -A latest_version=()
+
+  local entry base version current_latest
+  while IFS= read -r entry; do
+    read -r base version < <(parse_extension_entry "$entry")
+    [[ -n "$version" ]] || continue
+
+    current_latest=${latest_version[$base]:-}
+    if [[ -z "$current_latest" ]] || ver_gt "$version" "$current_latest"; then
+      latest_version[$base]=$version
+    fi
+  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+
+  local count=0
+  while IFS= read -r entry; do
+    read -r base version < <(parse_extension_entry "$entry")
+    [[ -n "$version" ]] || continue
+
+    if "$PRUNE_UNINSTALLED" && "$prune_ok" && [[ -z ${INSTALLED_EXT["$scope|$base"]:-} ]]; then
+      ((count += 1)) || true
+      continue
+    fi
+
+    if [[ "$version" != "${latest_version[$base]}" ]]; then
+      ((count += 1)) || true
+    fi
+  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+
+  printf '%s' "$count"
+}
+
+stale_extensions_bytes() {
+  local dir=$1
+  [[ -d "$dir" ]] || {
+    printf '0'
+    return 0
+  }
+
+  local prune_ok=false
+  local scope=""
+  if "$PRUNE_UNINSTALLED"; then
+    scope=$(prune_scope_for_dir "$dir")
+    if [[ -n ${PRUNE_SCOPE_LOADED[$scope]:-} ]]; then
+      prune_ok=true
+    fi
+  fi
+
+  declare -A latest_version=()
+
+  local entry base version current_latest
+  while IFS= read -r entry; do
+    read -r base version < <(parse_extension_entry "$entry")
+    [[ -n "$version" ]] || continue
+    current_latest=${latest_version[$base]:-}
+    if [[ -z "$current_latest" ]] || ver_gt "$version" "$current_latest"; then
+      latest_version[$base]=$version
+    fi
+  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+
+  local total=0
+  while IFS= read -r entry; do
+    read -r base version < <(parse_extension_entry "$entry")
+    [[ -n "$version" ]] || continue
+
+    if "$PRUNE_UNINSTALLED" && "$prune_ok" && [[ -z ${INSTALLED_EXT["$scope|$base"]:-} ]]; then
+      total=$((total + $(dir_size_bytes "$dir/$entry")))
+      continue
+    fi
+
+    if [[ "$version" != "${latest_version[$base]}" ]]; then
+      total=$((total + $(dir_size_bytes "$dir/$entry")))
+    fi
+  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+
+  printf '%s' "$total"
+}
+
+count_stale_hosts_dir() {
+  local dir=$1
+  [[ -d "$dir" ]] || {
+    printf '0'
+    return 0
+  }
+
+  local total=0
+  local line
+  while IFS= read -r line; do
+    ((++total))
+  done < <(host_entry_lines "$dir")
+
+  if ((total <= 1)); then
+    printf '0'
+  else
+    printf '%s' "$((total - 1))"
+  fi
+}
+
+stale_hosts_bytes() {
+  local dir=$1
+  [[ -d "$dir" ]] || {
+    printf '0'
+    return 0
+  }
+
+  local newest_name=""
+  newest_name=$(newest_host_entry_name "$dir")
+  [[ -n "$newest_name" ]] || {
+    printf '0'
+    return 0
+  }
+
+  local total=0
+  local line name
+  while IFS= read -r line; do
+    name=${line#* }
+    [[ "$name" == "$newest_name" ]] && continue
+    total=$((total + $(dir_size_bytes "$dir/$name")))
+  done < <(host_entry_lines "$dir")
+
+  printf '%s' "$total"
+}
+
+compute_stale_totals() {
+  STALE_EXT_COUNT=0
+  STALE_EXT_BYTES=0
+  STALE_HOST_COUNT=0
+  STALE_HOST_BYTES=0
+  EXT_USED_BYTES=0
+  HOST_USED_BYTES=0
+  CACHE_USED_BYTES=0
+  CACHE_RECLAIM_BYTES=0
+  EXT_EXISTING_COUNT=0
+  CACHE_EXISTING_COUNT=0
+  HOST_EXISTING_COUNT=0
+
+  local dir
+  for dir in "${EXT_DIRS[@]}"; do
+    if [[ -d "$dir" ]]; then
+      ((++EXT_EXISTING_COUNT))
+      EXT_USED_BYTES=$((EXT_USED_BYTES + $(dir_size_bytes "$dir")))
+    fi
+    local c sb
+    c=$(count_stale_extensions_dir "$dir") || c=0
+    sb=$(stale_extensions_bytes "$dir") || sb=0
+    c=${c:-0}
+    sb=${sb:-0}
+    ((STALE_EXT_COUNT += c)) || true
+    ((STALE_EXT_BYTES += sb)) || true
+  done
+
+  local host_dir
+  for host_dir in "${HOST_DIRS[@]}"; do
+    if [[ -d "$host_dir" ]] && host_dir_has_entries "$host_dir"; then
+      ((++HOST_EXISTING_COUNT))
+      local host_bytes
+      host_bytes=$(host_dir_used_bytes "$host_dir")
+      HOST_USED_BYTES=$((HOST_USED_BYTES + host_bytes))
+    fi
+    local c sb
+    c=$(count_stale_hosts_dir "$host_dir") || c=0
+    sb=$(stale_hosts_bytes "$host_dir") || sb=0
+    c=${c:-0}
+    sb=${sb:-0}
+    ((STALE_HOST_COUNT += c)) || true
+    ((STALE_HOST_BYTES += sb)) || true
+  done
+
+  local cfg
+  for cfg in "${CONFIG_DIRS[@]}"; do
+    local path
+    while IFS= read -r path; do
+      if [[ -d "$path" ]]; then
+        ((++CACHE_EXISTING_COUNT))
+        local bytes
+        bytes=$(dir_size_bytes "$path")
+        CACHE_USED_BYTES=$((CACHE_USED_BYTES + bytes))
+        CACHE_RECLAIM_BYTES=$((CACHE_RECLAIM_BYTES + bytes))
+      fi
+    done < <(cache_paths_for_cfg "$cfg")
+  done
+}
+
+print_detected() {
+  # de-duplicate variants
+  declare -A seen=()
+  local unique_variants=()
+  local v
+  for v in "${DETECTED_VARIANTS[@]}"; do
+    [[ -z "$v" ]] && continue
+    if [[ -z ${seen[$v]:-} ]]; then
+      unique_variants+=("$v")
+      seen[$v]=1
+    fi
+  done
+
+  if ((${#unique_variants[@]} > 0)); then
+    log "Detected:"
+    local v
+    for v in "${unique_variants[@]}"; do
+      printf '  - %s\n' "$v"
+    done
+  else
+    log "Detected: none"
+  fi
+}
+
+analyze_extensions() {
+  local -a existing=()
+  local -a missing=()
+  local dir
+  for dir in "${EXT_DIRS[@]}"; do
+    if [[ -d "$dir" ]]; then
+      existing+=("$dir")
+    else
+      missing+=("$dir")
+    fi
+  done
+
+  if ((${#existing[@]} == 0)); then
+    if "$VERBOSE" || [[ $TARGET == "extensions" ]]; then
+      if "$PRINT_GAP"; then
+        echo
+      fi
+      log "Extension: none found under known roots."
+      PRINT_GAP=true
+      if "$VERBOSE"; then
+        local display_missing=()
+        local m
+        for m in "${missing[@]}"; do
+          display_missing+=("$(human_path "$m")")
+        done
+        print_missing "extension paths" "${display_missing[@]}"
+      fi
+    fi
+    return
+  fi
+
+  if "$PRINT_GAP"; then
+    echo
+  fi
+  log "Extension"
+  PRINT_GAP=true
+  local path
+  local total_bytes=0
+  for path in "${existing[@]}"; do
+    local bytes
+    bytes=$(dir_size_bytes "$path")
+    printf '  %-8s %s\n' "$(format_bytes "$bytes")" "$(human_path "$path")"
+    total_bytes=$((total_bytes + bytes))
+  done
+
+  local stale_total=0
+  local stale_bytes=0
+  for dir in "${EXT_DIRS[@]}"; do
+    local c
+    if ! c=$(count_stale_extensions_dir "$dir"); then
+      c=0
+    fi
+    c=${c:-0}
+    ((stale_total += c)) || true
+    local sb
+    if ! sb=$(stale_extensions_bytes "$dir"); then
+      sb=0
+    fi
+    sb=${sb:-0}
+    ((stale_bytes += sb)) || true
+  done
+  STALE_EXT_COUNT=$stale_total
+  STALE_EXT_BYTES=$stale_bytes
+  if ((stale_total > 0)); then
+    log "Stale extension versions: $stale_total ($(format_bytes "$stale_bytes"))"
+  else
+    log "Stale extension versions: none (already keeping newest per extension)"
+  fi
+  report_prune_skips
+  report_prune_cli_usage
+
+  if ((${#missing[@]})); then
+    local display_missing=()
+    local m
+    for m in "${missing[@]}"; do
+      display_missing+=("$(human_path "$m")")
+    done
+    print_missing "extension paths (ignored)" "${display_missing[@]}"
+  fi
+}
+
+analyze_caches() {
+  local -a existing=()
+  local -a missing=()
+  local cfg
+  for cfg in "${CONFIG_DIRS[@]}"; do
+    local path
+    while IFS= read -r path; do
+      if [[ -d "$path" ]]; then
+        existing+=("$path")
+      else
+        missing+=("$path")
+      fi
+    done < <(cache_paths_for_cfg "$cfg")
+  done
+
+  if ((${#existing[@]} == 0)); then
+    if "$VERBOSE" || [[ $TARGET == "caches" ]]; then
+      if "$PRINT_GAP"; then
+        echo
+      fi
+      log "Cache & Log: none found under known roots."
+      PRINT_GAP=true
+      if "$VERBOSE"; then
+        local display_missing=()
+        local m
+        for m in "${missing[@]}"; do
+          display_missing+=("$(human_path "$m")")
+        done
+        print_missing "cache paths" "${display_missing[@]}"
+      fi
+    fi
+    return
+  fi
+
+  if "$PRINT_GAP"; then
+    echo
+  fi
+  log "Cache & Log"
+  PRINT_GAP=true
+  local path
+  for path in "${existing[@]}"; do
+    measure_path "$path"
+  done
+
+  if ((${#missing[@]})); then
+    local display_missing=()
+    local m
+    for m in "${missing[@]}"; do
+      display_missing+=("$(human_path "$m")")
+    done
+    print_missing "cache paths (ignored)" "${display_missing[@]}"
+  fi
+}
+
+analyze_hosts() {
+  local -a existing=()
+  local dir
+  for dir in "${HOST_DIRS[@]}"; do
+    if [[ -d "$dir" ]] && host_dir_has_entries "$dir"; then
+      existing+=("$dir")
+    fi
+  done
+
+  if ((${#existing[@]} == 0)); then
+    if "$VERBOSE" || [[ $TARGET == "hosts" ]]; then
+      if "$PRINT_GAP"; then
+        echo
+      fi
+      log "Server build: none found under known roots."
+      PRINT_GAP=true
+    fi
+    return
+  fi
+
+  if "$PRINT_GAP"; then
+    echo
+  fi
+  log "Server build"
+  PRINT_GAP=true
+  local path
+  for path in "${existing[@]}"; do
+    local bytes
+    bytes=$(host_dir_used_bytes "$path")
+    printf '  %-8s %s\n' "$(format_bytes "$bytes")" "$(human_path "$path")"
+  done
+
+  local stale_total=0
+  local stale_bytes=0
+  local host_dir
+  for host_dir in "${HOST_DIRS[@]}"; do
+    local c
+    if ! c=$(count_stale_hosts_dir "$host_dir"); then
+      c=0
+    fi
+    c=${c:-0}
+    ((stale_total += c)) || true
+    local sb
+    if ! sb=$(stale_hosts_bytes "$host_dir"); then
+      sb=0
+    fi
+    sb=${sb:-0}
+    ((stale_bytes += sb)) || true
+  done
+  STALE_HOST_COUNT=$stale_total
+  STALE_HOST_BYTES=$stale_bytes
+  if ((stale_total > 0)); then
+    log "Old server builds: $stale_total ($(format_bytes "$stale_bytes"))"
+  fi
+}
+
+print_summary() {
+  if [[ $ACTION != "analyze" ]]; then
+    return
+  fi
+  if "$PRINT_GAP"; then
+    echo
+  fi
+  log "Summary:"
+  case "$TARGET" in
+    hosts)
+      if ((HOST_EXISTING_COUNT > 0 || STALE_HOST_BYTES > 0)); then
+        local host_used
+        local host_rec
+        host_used=$(format_bytes "$HOST_USED_BYTES")
+        host_rec=$(format_bytes "$STALE_HOST_BYTES")
+        log "  Server build: total $host_used; old builds $host_rec"
+      else
+        log "  No server build data found under known roots."
+      fi
+      ;;
+    extensions)
+      if ((EXT_EXISTING_COUNT > 0 || STALE_EXT_BYTES > 0)); then
+        local ext_used
+        local ext_rec
+        ext_used=$(format_bytes "$EXT_USED_BYTES")
+        ext_rec=$(format_bytes "$STALE_EXT_BYTES")
+        log "  Extension: total $ext_used; stale reclaimable $ext_rec"
+      else
+        log "  No extension data found under known roots."
+      fi
+      ;;
+    caches)
+      if ((CACHE_EXISTING_COUNT > 0)); then
+        local cache_used
+        cache_used=$(format_bytes "$CACHE_USED_BYTES")
+        log "  Cache & Log: total $cache_used (all removable on clean)"
+      else
+        log "  No cache/log data found under known roots."
+      fi
+      ;;
+    all)
+      local any=false
+      if ((HOST_EXISTING_COUNT > 0 || STALE_HOST_BYTES > 0)); then
+        local host_used
+        local host_rec
+        host_used=$(format_bytes "$HOST_USED_BYTES")
+        host_rec=$(format_bytes "$STALE_HOST_BYTES")
+        log "  Server build: total $host_used; old builds $host_rec"
+        any=true
+      fi
+      if ((EXT_EXISTING_COUNT > 0 || STALE_EXT_BYTES > 0)); then
+        local ext_used
+        local ext_rec
+        ext_used=$(format_bytes "$EXT_USED_BYTES")
+        ext_rec=$(format_bytes "$STALE_EXT_BYTES")
+        log "  Extension: total $ext_used; stale reclaimable $ext_rec"
+        any=true
+      fi
+      if ((CACHE_EXISTING_COUNT > 0)); then
+        local cache_used
+        cache_used=$(format_bytes "$CACHE_USED_BYTES")
+        log "  Cache & Log: total $cache_used (all removable on clean)"
+        any=true
+      fi
+      if ! "$any"; then
+        log "  No VS Code data found under known roots."
+      fi
+      ;;
+  esac
+}
+
+analyze_paths() {
+  prepare_prune_scopes
+  compute_stale_totals
+  print_detected
+  PRINT_GAP=true
+  case "$TARGET" in
+    extensions)
+      analyze_extensions
+      ;;
+    caches)
+      analyze_caches
+      ;;
+    hosts)
+      analyze_hosts
+      ;;
+    all)
+      analyze_hosts
+      analyze_extensions
+      analyze_caches
+      ;;
+    *)
+      err "Unknown target: $TARGET"
+      ;;
+  esac
+  print_summary
+}
+
+build_clean_plan() {
+  PLAN_REMOVALS=()
+  PLAN_SEEN=()
+  TARGET_PATH_FOUND=false
+
+  case "$TARGET" in
+    extensions)
+      local dir
+      for dir in "${EXT_DIRS[@]}"; do
+        plan_extension_dir "$dir"
+      done
+      ;;
+    caches)
+      local cfg
+      for cfg in "${CONFIG_DIRS[@]}"; do
+        plan_config_dir "$cfg"
+      done
+      ;;
+    hosts)
+      local host
+      for host in "${HOST_DIRS[@]}"; do
+        plan_host_dir "$host"
+      done
+      ;;
+    all)
+      local dir cfg host
+      for dir in "${EXT_DIRS[@]}"; do
+        plan_extension_dir "$dir"
+      done
+      for cfg in "${CONFIG_DIRS[@]}"; do
+        plan_config_dir "$cfg"
+      done
+      for host in "${HOST_DIRS[@]}"; do
+        plan_host_dir "$host"
+      done
+      ;;
+    *)
+      err "Unknown target: $TARGET"
+      ;;
+  esac
+}
+
+perform_clean() {
+  build_clean_plan
+  report_prune_skips
+  report_prune_cli_usage
+
+  if [[ ${#PLAN_REMOVALS[@]} -eq 0 ]]; then
+    if ! "$TARGET_PATH_FOUND"; then
+      case "$TARGET" in
+        extensions)
+          log "No extension directories found; nothing to clean"
+          ;;
+        caches)
+          log "No cache directories found; nothing to clean"
+          ;;
+        *)
+          log "Nothing to clean"
+          ;;
+      esac
+    else
+      log "Nothing to clean"
+    fi
+    return
+  fi
+
+  validate_removal_paths
+
+  log "Targets:"
+  local total_bytes=0
+  local path bytes
+  for path in "${PLAN_REMOVALS[@]}"; do
+    bytes=$(dir_size_bytes "$path")
+    bytes=${bytes:-0}
+    total_bytes=$((total_bytes + bytes))
+    printf '  %-8s %s\n' "$(format_bytes "$bytes")" "$(human_path "$path")"
+  done
+
+  if ! "$EXECUTE"; then
+    log "Dry-run only."
+    log "Reclaimable (est.): $(format_bytes "$total_bytes") (${#PLAN_REMOVALS[@]} paths)"
+    log "Re-run with --execute to delete."
+    return
+  fi
+
+  local -a failed=()
+  for path in "${PLAN_REMOVALS[@]}"; do
+    if ! rm -rf -- "$path"; then
+      failed+=("$(human_path "$path")")
+    fi
+  done
+
+  if ((${#failed[@]})); then
+    err "Failed to delete ${#failed[@]} path(s): $(join_by ', ' "${failed[@]}")"
+  fi
+
+  log "Deleted ${#PLAN_REMOVALS[@]} paths (reclaimed $(format_bytes "$total_bytes"))"
+}
+
+set_target() {
+  local new_target=$1
+  if "$TARGET_SET" && [[ $TARGET != "$new_target" ]]; then
+    err "Conflicting targets: $TARGET already set, cannot set $new_target"
+  fi
+  TARGET=$new_target
+  TARGET_SET=true
+}
+
+set_action() {
+  local new_action=$1
+  if "$ACTION_SET" && [[ $ACTION != "$new_action" ]]; then
+    err "Conflicting actions: $ACTION already set, cannot set $new_action"
+  fi
+  ACTION=$new_action
+  ACTION_SET=true
+}
+
+parse_args() {
+  declare -a POSITIONALS=()
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      extensions)
+        POSITIONALS+=("extensions")
+        ;;
+      caches)
+        POSITIONALS+=("caches")
+        ;;
+      hosts)
+        POSITIONALS+=("hosts")
+        ;;
+      all)
+        POSITIONALS+=("all")
+        ;;
+      analyze)
+        POSITIONALS+=("analyze")
+        ;;
+      clean)
+        POSITIONALS+=("clean")
+        ;;
+      --execute | -x)
+        EXECUTE=true
+        ;;
+      --prune-uninstalled | -p)
+        PRUNE_UNINSTALLED=true
+        EXT_FLAG_USED=true
+        ;;
+      --include-workspace-storage | -w)
+        INCLUDE_WS_STORAGE=true
+        CACHE_FLAG_USED=true
+        ;;
+      --include-global-storage | -g)
+        INCLUDE_GLOBAL_STORAGE=true
+        CACHE_FLAG_USED=true
+        ;;
+      --extensions-path | -E)
+        EXT_FLAG_USED=true
+        shift
+        [[ $# -gt 0 ]] || err "--extensions-path requires a value"
+        validate_user_dir "--extensions-path" "$1"
+        EXT_DIRS+=("$1")
+        ;;
+      --config-path | -C)
+        CACHE_FLAG_USED=true
+        shift
+        [[ $# -gt 0 ]] || err "--config-path requires a value"
+        validate_user_dir "--config-path" "$1"
+        CONFIG_DIRS+=("$1")
+        ;;
+      --host-path | -H)
+        HOST_FLAG_USED=true
+        shift
+        [[ $# -gt 0 ]] || err "--host-path requires a value"
+        validate_user_dir "--host-path" "$1"
+        HOST_DIRS+=("$1")
+        ;;
+      --verbose | -v)
+        VERBOSE=true
+        ;;
+      --help | -h)
+        usage
+        exit 0
+        ;;
+      -*)
+        err "Unknown flag: $1"
+        ;;
+      *)
+        err "Unexpected argument: $1"
+        ;;
+    esac
+    shift
+  done
+
+  if ((${#POSITIONALS[@]} == 0)); then
+    TARGET="all"
+    ACTION=${ACTION:-analyze}
+  else
+    if [[ ${POSITIONALS[0]} == extensions || ${POSITIONALS[0]} == caches || ${POSITIONALS[0]} == hosts || ${POSITIONALS[0]} == all ]]; then
+      set_target "${POSITIONALS[0]}"
+      if ((${#POSITIONALS[@]} > 1)); then
+        set_action "${POSITIONALS[1]}"
+      fi
+    elif [[ ${POSITIONALS[0]} == analyze || ${POSITIONALS[0]} == clean ]]; then
+      if ((${#POSITIONALS[@]} > 1)); then
+        err "Target must come before action (use: vscode-broom [target] [action])"
+      fi
+      set_action "${POSITIONALS[0]}"
+      TARGET=${TARGET:-all}
+    else
+      err "Unexpected argument: ${POSITIONALS[0]}"
+    fi
+
+    if ((${#POSITIONALS[@]} > 2)); then
+      err "Too many arguments: ${POSITIONALS[*]}"
+    fi
+  fi
+
+  case "$TARGET" in
+    extensions | caches | hosts | all) ;;
+    *)
+      err "Unknown target: $TARGET"
+      ;;
+  esac
+
+  case "$ACTION" in
+    analyze | clean) ;;
+    *)
+      err "Unknown action: $ACTION"
+      ;;
+  esac
+
+  if [[ $TARGET == "extensions" ]] && "$CACHE_FLAG_USED"; then
+    err "Cache flags used while target is extensions"
+  fi
+
+  if [[ $TARGET == "caches" ]] && "$EXT_FLAG_USED"; then
+    err "Extension flags used while target is caches"
+  fi
+
+  if [[ $TARGET == "hosts" ]] && "$EXT_FLAG_USED"; then
+    err "Extension flags used while target is hosts"
+  fi
+
+  if [[ $TARGET != "hosts" && $TARGET != "all" ]] && "$HOST_FLAG_USED"; then
+    err "Host flags used while target is $TARGET"
+  fi
+}
+
+main() {
+  parse_args "$@"
+
+  if [[ ${#EXT_DIRS[@]} -eq 0 ]]; then
+    EXT_DIRS=("${DEFAULT_EXT_DIRS[@]}")
+  fi
+
+  if [[ ${#CONFIG_DIRS[@]} -eq 0 ]]; then
+    CONFIG_DIRS=("${DEFAULT_CONFIG_DIRS[@]}")
+  fi
+
+  if [[ ${#HOST_DIRS[@]} -eq 0 ]]; then
+    HOST_DIRS=("${DEFAULT_HOST_DIRS[@]}")
+  fi
+  dedupe_ext_dirs
+  dedupe_config_dirs
+  dedupe_host_dirs
+
+  case "$ACTION" in
+    analyze)
+      analyze_paths
+      ;;
+    clean)
+      perform_clean
+      ;;
+    *)
+      err "Unsupported action: $ACTION"
+      ;;
+  esac
+}
+
+main "$@"
