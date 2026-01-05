@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      pull-requests: write
+    env:
+      REVIEWDOG_REPORTER: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != null && github.event.pull_request.head.repo.full_name == github.repository && 'github-pr-review' || 'github-check' }}
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - name: Bash syntax
+        run: |
+          for file in bin/vscode-broom tests/*.sh; do
+            bash -n "$file"
+          done
+      - name: Shellcheck (reviewdog)
+        uses: reviewdog/action-shellcheck@4c07458293ac342d477251099501a718ae5ef86e # v1.32.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          reporter: ${{ env.REVIEWDOG_REPORTER }}
+          filter_mode: diff_context
+          check_all_files_with_shebangs: "true"
+          fail_on_error: true
+          fail_level: warning
+      - name: shfmt (reviewdog)
+        uses: reviewdog/action-shfmt@d8f080930b9be5847b4f97e9f4122b81a82aaeac # v1.0.4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          filter_mode: diff_context
+          fail_on_error: true
+          reviewdog_flags: -reporter=${{ env.REVIEWDOG_REPORTER }}
+          shfmt_flags: -i 2 -ci -sr
+
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - name: Tests
+        run: ./tests/run.sh

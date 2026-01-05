@@ -6,7 +6,7 @@
 - Do keep path safety checks when adding new path flags; `validate_user_dir` rejects `/` and `$HOME`.
 - Do update `usage()` output and related tests when adding or renaming flags; CLI output is asserted.
 - Do keep changes minimal; avoid large reformatting or unrelated refactors.
-- Do run `./tests/run.sh` locally after changes; there is no CI.
+- Do run `./tests/run.sh` locally after changes; CI does not replace local runs.
 - Don't loosen deletion safeguards or root-path checks without explicit discussion.
 - Don't add dependencies or broaden deletion scope without discussion.
 
