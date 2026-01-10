@@ -1075,6 +1075,12 @@ parse_extension_entry() {
   fi
 }
 
+extension_entries() {
+  local dir=$1
+  [[ -d "$dir" ]] || return 0
+  find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n'
+}
+
 plan_extension_dir() {
   local dir=$1
   [[ -d "$dir" ]] || return 0
@@ -1091,8 +1097,11 @@ plan_extension_dir() {
 
   declare -A latest_version=()
 
+  local -a entries=()
+  mapfile -t entries < <(extension_entries "$dir")
+
   local entry base version current_latest
-  while IFS= read -r entry; do
+  for entry in "${entries[@]}"; do
     read -r base version < <(parse_extension_entry "$entry")
     [[ -n "$version" ]] || continue
 
@@ -1100,9 +1109,9 @@ plan_extension_dir() {
     if [[ -z "$current_latest" ]] || ver_gt "$version" "$current_latest"; then
       latest_version[$base]=$version
     fi
-  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+  done
 
-  while IFS= read -r entry; do
+  for entry in "${entries[@]}"; do
     read -r base version < <(parse_extension_entry "$entry")
     [[ -n "$version" ]] || continue
 
@@ -1114,7 +1123,7 @@ plan_extension_dir() {
     if [[ "$version" != "${latest_version[$base]}" ]]; then
       add_removal "$dir/$entry"
     fi
-  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+  done
 }
 
 plan_config_dir() {
@@ -1221,10 +1230,10 @@ plan_host_dir() {
   done < <(host_entry_lines "$dir")
 }
 
-count_stale_extensions_dir() {
+stale_extensions_stats() {
   local dir=$1
   [[ -d "$dir" ]] || {
-    printf '0'
+    printf '0\t0\n'
     return 0
   }
 
@@ -1237,10 +1246,12 @@ count_stale_extensions_dir() {
     fi
   fi
 
-  declare -A latest_version=()
+  local -a entries=()
+  mapfile -t entries < <(extension_entries "$dir")
 
+  declare -A latest_version=()
   local entry base version current_latest
-  while IFS= read -r entry; do
+  for entry in "${entries[@]}"; do
     read -r base version < <(parse_extension_entry "$entry")
     [[ -n "$version" ]] || continue
 
@@ -1248,70 +1259,27 @@ count_stale_extensions_dir() {
     if [[ -z "$current_latest" ]] || ver_gt "$version" "$current_latest"; then
       latest_version[$base]=$version
     fi
-  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+  done
 
   local count=0
-  while IFS= read -r entry; do
-    read -r base version < <(parse_extension_entry "$entry")
-    [[ -n "$version" ]] || continue
-
-    if "$PRUNE_UNINSTALLED" && "$prune_ok" && [[ -z ${INSTALLED_EXT["$scope|$base"]:-} ]]; then
-      ((count += 1)) || true
-      continue
-    fi
-
-    if [[ "$version" != "${latest_version[$base]}" ]]; then
-      ((count += 1)) || true
-    fi
-  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
-
-  printf '%s' "$count"
-}
-
-stale_extensions_bytes() {
-  local dir=$1
-  [[ -d "$dir" ]] || {
-    printf '0'
-    return 0
-  }
-
-  local prune_ok=false
-  local scope=""
-  if "$PRUNE_UNINSTALLED"; then
-    scope=$(prune_scope_for_dir "$dir")
-    if [[ -n ${PRUNE_SCOPE_LOADED[$scope]:-} ]]; then
-      prune_ok=true
-    fi
-  fi
-
-  declare -A latest_version=()
-
-  local entry base version current_latest
-  while IFS= read -r entry; do
-    read -r base version < <(parse_extension_entry "$entry")
-    [[ -n "$version" ]] || continue
-    current_latest=${latest_version[$base]:-}
-    if [[ -z "$current_latest" ]] || ver_gt "$version" "$current_latest"; then
-      latest_version[$base]=$version
-    fi
-  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
-
   local total=0
-  while IFS= read -r entry; do
+  for entry in "${entries[@]}"; do
     read -r base version < <(parse_extension_entry "$entry")
     [[ -n "$version" ]] || continue
 
     if "$PRUNE_UNINSTALLED" && "$prune_ok" && [[ -z ${INSTALLED_EXT["$scope|$base"]:-} ]]; then
+      ((count += 1)) || true
       total=$((total + $(dir_size_bytes "$dir/$entry")))
       continue
     fi
 
     if [[ "$version" != "${latest_version[$base]}" ]]; then
+      ((count += 1)) || true
       total=$((total + $(dir_size_bytes "$dir/$entry")))
     fi
-  done < <(find "$dir" -maxdepth 1 -mindepth 1 -type d -printf '%f\n')
+  done
 
-  printf '%s' "$total"
+  printf '%s\t%s\n' "$count" "$total"
 }
 
 count_stale_hosts_dir() {
@@ -1378,9 +1346,9 @@ compute_stale_totals() {
       ((++EXT_EXISTING_COUNT))
       EXT_USED_BYTES=$((EXT_USED_BYTES + $(dir_size_bytes "$dir")))
     fi
-    local c sb
-    c=$(count_stale_extensions_dir "$dir") || c=0
-    sb=$(stale_extensions_bytes "$dir") || sb=0
+    local c=0
+    local sb=0
+    read -r c sb < <(stale_extensions_stats "$dir")
     c=${c:-0}
     sb=${sb:-0}
     ((STALE_EXT_COUNT += c)) || true
@@ -1444,6 +1412,7 @@ print_detected() {
 }
 
 analyze_extensions() {
+  # STALE_* values are computed by compute_stale_totals.
   local -a existing=()
   local -a missing=()
   local dir
@@ -1488,24 +1457,8 @@ analyze_extensions() {
     total_bytes=$((total_bytes + bytes))
   done
 
-  local stale_total=0
-  local stale_bytes=0
-  for dir in "${EXT_DIRS[@]}"; do
-    local c
-    if ! c=$(count_stale_extensions_dir "$dir"); then
-      c=0
-    fi
-    c=${c:-0}
-    ((stale_total += c)) || true
-    local sb
-    if ! sb=$(stale_extensions_bytes "$dir"); then
-      sb=0
-    fi
-    sb=${sb:-0}
-    ((stale_bytes += sb)) || true
-  done
-  STALE_EXT_COUNT=$stale_total
-  STALE_EXT_BYTES=$stale_bytes
+  local stale_total=$STALE_EXT_COUNT
+  local stale_bytes=$STALE_EXT_BYTES
   if ((stale_total > 0)); then
     log "Stale extension versions: $stale_total ($(format_bytes "$stale_bytes"))"
   else
@@ -1579,6 +1532,7 @@ analyze_caches() {
 }
 
 analyze_hosts() {
+  # STALE_* values are computed by compute_stale_totals.
   local -a existing=()
   local dir
   for dir in "${HOST_DIRS[@]}"; do
@@ -1610,25 +1564,8 @@ analyze_hosts() {
     printf '  %-8s %s\n' "$(format_bytes "$bytes")" "$(human_path "$path")"
   done
 
-  local stale_total=0
-  local stale_bytes=0
-  local host_dir
-  for host_dir in "${HOST_DIRS[@]}"; do
-    local c
-    if ! c=$(count_stale_hosts_dir "$host_dir"); then
-      c=0
-    fi
-    c=${c:-0}
-    ((stale_total += c)) || true
-    local sb
-    if ! sb=$(stale_hosts_bytes "$host_dir"); then
-      sb=0
-    fi
-    sb=${sb:-0}
-    ((stale_bytes += sb)) || true
-  done
-  STALE_HOST_COUNT=$stale_total
-  STALE_HOST_BYTES=$stale_bytes
+  local stale_total=$STALE_HOST_COUNT
+  local stale_bytes=$STALE_HOST_BYTES
   if ((stale_total > 0)); then
     log "Old server builds: $stale_total ($(format_bytes "$stale_bytes"))"
   fi
