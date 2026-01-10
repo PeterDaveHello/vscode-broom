@@ -16,6 +16,7 @@ esac
 
 TEST_NUM=0
 FAILURES=0
+OUT_DIAGGED=false
 
 tap_diag() {
   printf '# %s\n' "$*"
@@ -41,6 +42,7 @@ expect_match() {
   else
     tap_not_ok "$desc"
     tap_diag "expected pattern: $pattern"
+    dump_out_once
   fi
 }
 
@@ -71,6 +73,50 @@ line_no() {
   printf '%s' "${line:-0}"
 }
 
+dump_out_once() {
+  if "$OUT_DIAGGED"; then
+    return
+  fi
+  OUT_DIAGGED=true
+  tap_diag "output (first 50 lines):"
+  local line_count=0
+  while IFS= read -r line; do
+    tap_diag "$line"
+    ((line_count++))
+    if ((line_count >= 50)); then
+      tap_diag "... (truncated)"
+      break
+    fi
+  done < <(printf '%s\n' "$OUT")
+}
+
+run_target_analyze_test() {
+  local target=$1
+
+  OUT_DIAGGED=false
+  STATUS=0
+  if OUT="$("$ROOT/bin/vscode-broom" "$target")"; then
+    STATUS=0
+  else
+    STATUS=$?
+  fi
+  if [[ $STATUS -eq 0 ]]; then
+    tap_ok "runs ${target} analyze"
+  else
+    tap_not_ok "runs ${target} analyze"
+    tap_diag "exit status: $STATUS"
+  fi
+  if "$VERBOSE" || [[ $STATUS -ne 0 ]]; then
+    tap_diag "command: $ROOT/bin/vscode-broom $target"
+    while IFS= read -r line; do
+      tap_diag "$line"
+    done < <(printf '%s\n' "$OUT")
+    OUT_DIAGGED=true
+  fi
+  expect_match "${target} analyze prints Summary section" "^Summary:$"
+  expect_match "${target} analyze prints reclaimable summary" "^  Reclaimable \\(est\\.\\): [0-9]+"
+}
+
 # Fixture: extensions with one stale version
 mkdir -p \
   "$HOME/.vscode/extensions/extA-1.0" \
@@ -99,8 +145,9 @@ echo x > "$HOME/.vscode-server/data/User/workspaceStorage/w"
 echo x > "$HOME/.vscode-server/data/User/globalStorage/g"
 
 echo "TAP version 13"
-echo "1..22"
+echo "1..32"
 
+OUT_DIAGGED=false
 STATUS=0
 if OUT="$("$ROOT/bin/vscode-broom")"; then
   STATUS=0
@@ -134,6 +181,7 @@ expect_match "prints 1 stale extension version" "^Stale extension versions: 1"
 
 expect_match "prints Cache & Log section" "^Cache & Log$"
 expect_match "prints Summary section" "^Summary:$"
+expect_match "prints Summary reclaimable total" "^  Reclaimable \\(est\\.\\): [0-9]+"
 expect_no_match "does not print missing paths by default" "^Missing "
 
 server_line=$(line_no "^Server build$")
@@ -147,6 +195,11 @@ else
   tap_diag "line numbers: server=$server_line extension=$ext_line cache=$cache_line summary=$summary_line"
 fi
 
+run_target_analyze_test "hosts"
+run_target_analyze_test "extensions"
+run_target_analyze_test "caches"
+
+OUT_DIAGGED=false
 STATUS=0
 if OUT="$("$ROOT/bin/vscode-broom" clean)"; then
   STATUS=0
@@ -172,6 +225,7 @@ else
   tap_not_ok "dry-run does not delete targets"
 fi
 
+OUT_DIAGGED=false
 STATUS=0
 if OUT="$("$ROOT/bin/vscode-broom" clean --execute)"; then
   STATUS=0

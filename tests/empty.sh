@@ -55,7 +55,7 @@ expect_no_match() {
 }
 
 echo "TAP version 13"
-echo "1..10"
+echo "1..11"
 
 STATUS=0
 if OUT="$("$ROOT/bin/vscode-broom")"; then
@@ -81,6 +81,7 @@ fi
 expect_match "prints 'Detected: none'" "^Detected: none$"
 expect_match "prints Summary section" "^Summary:$"
 expect_match "prints empty summary message" "No VS Code data found under known roots\\.$"
+expect_no_match "does not print reclaimable summary" "^  Reclaimable \\(est\\.\\):"
 expect_no_match "does not print any sections" "^(Server build|Extension|Cache & Log)$"
 expect_no_match "does not print missing paths by default" "^Missing "
 
