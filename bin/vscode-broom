@@ -15,6 +15,7 @@ EXT_FLAG_USED=false
 CACHE_FLAG_USED=false
 HOST_FLAG_USED=false
 VERBOSE=false
+QUIET=false
 
 EXT_DIRS=()
 CONFIG_DIRS=()
@@ -42,6 +43,30 @@ DEFAULT_ROOTS=(
   "$HOME/.vscode-oss"
   "$HOME/.vscode-server"
   "$HOME/.vscode-server-insiders"
+)
+
+BANNER_VSCODE_LINES=(
+  '██    ██  ██████   ██████   ██████   ██████   ███████'
+  '██    ██ ██       ██    ██ ██    ██  ██   ██  ██     '
+  '██    ██ ███████  ██       ██    ██  ██   ██  █████  '
+  ' ██  ██       ██  ██       ██    ██  ██   ██  ██     '
+  '  ████    ██████   ██████   ██████   ██████   ███████'
+)
+
+BANNER_BROOM_ICON=(
+  '       █'
+  '      █ '
+  '     █  '
+  '   ▄███▄'
+  '   ▀▀▀▀▀'
+)
+
+BANNER_BROOM_TEXT=(
+  '██████   ██████   ██████   ██████   ███    ███'
+  '██   ██  ██   ██ ██    ██ ██    ██  ████  ████'
+  '██████   ██████  ██    ██ ██    ██  ██ ████ ██'
+  '██   ██  ██   ██ ██    ██ ██    ██  ██  ██  ██'
+  '██████   ██   ██  ██████   ██████   ██      ██'
 )
 
 variant_label() {
@@ -411,7 +436,284 @@ format_bytes() {
   numfmt --to=iec --suffix=B "$bytes" 2> /dev/null || echo "${bytes}B"
 }
 
+utf8_locale() {
+  local locale=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
+  locale=${locale,,}
+  [[ $locale == *utf-8* || $locale == *utf8* ]]
+}
+
+color_enabled() {
+  [[ -t 1 ]] || return 1
+  [[ -z ${NO_COLOR+x} ]] || return 1
+  [[ ${TERM:-} != "dumb" ]] || return 1
+
+  if ! command_exists tput; then
+    return 1
+  fi
+
+  local colors
+  colors=$(tput colors 2> /dev/null || true)
+  [[ "$colors" =~ ^[0-9]+$ ]] || return 1
+  [[ "$colors" -ge 8 ]]
+}
+
+print_banner_plain() {
+  local line
+  for line in "${BANNER_VSCODE_LINES[@]}"; do
+    printf '%s\n' "$line"
+  done
+  printf '\n'
+
+  local i
+  for i in "${!BANNER_BROOM_TEXT[@]}"; do
+    printf '%s   %s\n' "${BANNER_BROOM_ICON[$i]}" "${BANNER_BROOM_TEXT[$i]}"
+  done
+  printf '\n'
+
+  local footer_suffix=$' \xF0\x9F\xA7\xB9'
+  printf '%s%s\n' "VSCODE BROOM" "$footer_suffix"
+  printf '\n'
+}
+
+truecolor_enabled() {
+  [[ -n "${COLORTERM:-}" ]] && [[ "$COLORTERM" == "truecolor" || "$COLORTERM" == "24bit" ]]
+}
+
+ansi_palette_level() {
+  local colors
+  colors=$(tput colors 2> /dev/null || true)
+  if [[ ! "$colors" =~ ^[0-9]+$ ]]; then
+    printf '8'
+    return 0
+  fi
+
+  if ((colors >= 256)); then
+    printf '256'
+  elif ((colors >= 16)); then
+    printf '16'
+  else
+    printf '8'
+  fi
+}
+
+print_gradient_string_ansi() {
+  local line=$1
+  shift
+  local -a palette=("$@")
+  local count=${#palette[@]}
+  local len=${#line}
+  local i char idx color
+
+  if ((count == 0)); then
+    printf '%s' "$line"
+    return 0
+  fi
+
+  if ((len < 2)); then
+    printf '\033[38;5;%dm%s' "${palette[0]}" "$line"
+    return 0
+  fi
+
+  for ((i = 0; i < len; i++)); do
+    char="${line:$i:1}"
+    if [[ "$char" == " " ]]; then
+      printf " "
+      continue
+    fi
+    idx=$((i * (count - 1) / (len - 1)))
+    color=${palette[$idx]}
+    printf '\033[38;5;%dm%s' "$color" "$char"
+  done
+}
+
+print_gradient_line_ansi() {
+  local line=$1
+  shift
+  print_gradient_string_ansi "$line" "$@"
+  printf '\033[0m\n'
+}
+
+print_banner_ansi() {
+  local reset=$'\033[0m'
+  local palette_level
+  palette_level=$(ansi_palette_level)
+  local -a vscode_palette=()
+  local -a broom_palette=()
+  local -a footer_palette=()
+  local -a handle_palette=()
+  local -a bristle_palette=()
+  local line i
+
+  case "$palette_level" in
+    256)
+      vscode_palette=(33 39 45 51 87)
+      broom_palette=(129 135 141 177 205)
+      footer_palette=(39 45 51 87 123)
+      handle_palette=(94 130 136)
+      bristle_palette=(220 214 208)
+      ;;
+    16)
+      vscode_palette=(12 14 7)
+      broom_palette=(13 5 7)
+      footer_palette=(14 6 7)
+      handle_palette=(3 11)
+      bristle_palette=(11 7)
+      ;;
+    *)
+      vscode_palette=(4 6)
+      broom_palette=(5 7)
+      footer_palette=(6 7)
+      handle_palette=(3)
+      bristle_palette=(3 7)
+      ;;
+  esac
+
+  # VSCODE: Gradient
+  for line in "${BANNER_VSCODE_LINES[@]}"; do
+    print_gradient_line_ansi "$line" "${vscode_palette[@]}"
+  done
+  printf '\n'
+
+  # BROOM: Icon + Text
+  for i in "${!BANNER_BROOM_TEXT[@]}"; do
+    # Icon
+    local icon="${BANNER_BROOM_ICON[$i]}"
+    if [[ $i -lt 3 ]]; then
+      print_gradient_string_ansi "$icon" "${handle_palette[@]}"
+    else
+      print_gradient_string_ansi "$icon" "${bristle_palette[@]}"
+    fi
+    printf '%s   ' "$reset"
+
+    # Text
+    print_gradient_string_ansi "${BANNER_BROOM_TEXT[$i]}" "${broom_palette[@]}"
+    printf '%s\n' "$reset"
+  done
+  printf '\n'
+
+  local footer_suffix=$' \xF0\x9F\xA7\xB9'
+  local footer_color=${footer_palette[$((${#footer_palette[@]} - 1))]}
+  print_gradient_string_ansi "VSCODE BROOM" "${footer_palette[@]}"
+  printf '\033[38;5;%dm%s%s\n\n' "$footer_color" "$footer_suffix" "$reset"
+}
+
+print_gradient_string_truecolor() {
+  local text=$1
+  local start_r=$2 start_g=$3 start_b=$4
+  local end_r=$5 end_g=$6 end_b=$7
+
+  local len=${#text}
+  local denom=$((len - 1))
+  ((denom > 0)) || denom=1
+  local i char r g b
+
+  for ((i = 0; i < len; i++)); do
+    char="${text:$i:1}"
+    if [[ "$char" == " " ]]; then
+      printf " "
+      continue
+    fi
+    r=$((start_r + (end_r - start_r) * i / denom))
+    g=$((start_g + (end_g - start_g) * i / denom))
+    b=$((start_b + (end_b - start_b) * i / denom))
+    printf '\033[38;2;%d;%d;%dm%s' "$r" "$g" "$b" "$char"
+  done
+}
+
+print_banner_truecolor() {
+  local reset=$'\033[0m'
+  local line i j char
+
+  # VSCODE: Blue -> Cyan
+  for line in "${BANNER_VSCODE_LINES[@]}"; do
+    print_gradient_string_truecolor "$line" 0 122 204 0 180 216
+    printf '%s\n' "$reset"
+  done
+  printf '\n'
+
+  # BROOM: Icon (Brown/Gold) + Text (Purple -> Pink)
+  for i in "${!BANNER_BROOM_TEXT[@]}"; do
+    # Icon
+    local icon="${BANNER_BROOM_ICON[$i]}"
+    local icon_len=${#icon}
+    for ((j = 0; j < icon_len; j++)); do
+      char="${icon:$j:1}"
+      if [[ "$char" == " " ]]; then
+        printf " "
+        continue
+      fi
+      if [[ $i -lt 3 ]]; then
+        # Handle: Brown
+        printf '\033[38;2;139;69;19m%s' "$char"
+      else
+        # Bristles: Gold
+        printf '\033[38;2;255;215;0m%s' "$char"
+      fi
+    done
+    printf '\033[0m   '
+
+    # Text
+    print_gradient_string_truecolor "${BANNER_BROOM_TEXT[$i]}" 138 43 226 255 20 147
+    printf '%s\n' "$reset"
+  done
+  printf '\n'
+
+  # Footer Text Gradient
+  local footer_suffix=$' \xF0\x9F\xA7\xB9'
+  print_gradient_string_truecolor "VSCODE BROOM" 0 122 204 255 20 147
+  printf '\033[38;2;255;20;147m%s%s\n\n' "$footer_suffix" "$reset"
+}
+
+print_banner_ascii() {
+  local line
+  for line in "${BANNER_VSCODE_LINES[@]}"; do
+    # Replace block characters with ASCII equivalents
+    line=${line//█/#}
+    printf '%s\n' "$line"
+  done
+  printf '\n'
+
+  local i
+  for i in "${!BANNER_BROOM_TEXT[@]}"; do
+    # Icon
+    local icon="${BANNER_BROOM_ICON[$i]}"
+    icon=${icon//█/#}
+    icon=${icon//▄/_}
+    icon=${icon//▀/-}
+    printf '%s   ' "$icon"
+
+    # Text
+    local text="${BANNER_BROOM_TEXT[$i]}"
+    text=${text//█/#}
+    printf '%s\n' "$text"
+  done
+  printf '\n'
+
+  printf 'VSCODE BROOM\n\n'
+}
+
+print_banner() {
+  "$QUIET" && return 0
+
+  if ! utf8_locale; then
+    print_banner_ascii
+    return 0
+  fi
+
+  if color_enabled; then
+    if truecolor_enabled; then
+      print_banner_truecolor
+    else
+      print_banner_ansi
+    fi
+    return 0
+  fi
+
+  print_banner_plain
+}
+
 usage() {
+  print_banner
   printf '%s\n' \
     'Usage:' \
     '  vscode-broom [target] [action] [options]' \
@@ -442,6 +744,7 @@ usage() {
     'Global options' \
     '  -x, --execute                   Execute deletions (otherwise dry-run)' \
     '  -v, --verbose                   Show missing paths in detail' \
+    '  -q, --quiet                     Suppress banner output' \
     '  -h, --help                      Show this help' \
     '' \
     'Examples' \
@@ -1597,6 +1900,9 @@ parse_args() {
       --verbose | -v)
         VERBOSE=true
         ;;
+      --quiet | -q)
+        QUIET=true
+        ;;
       --help | -h)
         usage
         exit 0
@@ -1667,7 +1973,18 @@ parse_args() {
 }
 
 main() {
+  # Pre-scan --quiet so banner is suppressed when usage() is called from parse_args.
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      --quiet | -q)
+        QUIET=true
+        ;;
+    esac
+  done
+
   parse_args "$@"
+  print_banner
   require_runtime_deps
 
   if [[ ${#EXT_DIRS[@]} -eq 0 ]]; then

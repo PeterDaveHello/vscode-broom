@@ -63,6 +63,7 @@ Host options
 Global options
   -x, --execute                   Execute deletions (otherwise dry-run)
   -v, --verbose                   Show missing paths in detail
+  -q, --quiet                     Suppress banner output
   -h, --help                      Show this help
 
 Examples
@@ -73,6 +74,9 @@ Examples
   vscode-broom extensions clean --prune-uninstalled --execute
   vscode-broom caches clean --execute
 ```
+
+By default, the CLI prints a block-art banner. Use `--quiet` to suppress it.
+Color is enabled only when supported and `NO_COLOR` is not set.
 
 ## Default coverage
 
