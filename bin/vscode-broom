@@ -70,12 +70,9 @@ BANNER_BROOM_TEXT=(
 )
 
 variant_label() {
-  local root=$1
+  local root="${1%/}"
   case "$root" in
     */cli)
-      printf 'VS Code Server'
-      ;;
-    */cli/)
       printf 'VS Code Server'
       ;;
     */.vscode-server-insiders*)
@@ -438,8 +435,14 @@ format_bytes() {
 
 utf8_locale() {
   local locale=${LC_ALL:-${LC_CTYPE:-${LANG:-}}}
-  locale=${locale,,}
-  [[ $locale == *utf-8* || $locale == *utf8* ]]
+  case "${locale,,}" in
+    *utf-8* | *utf8*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 color_enabled() {
@@ -476,7 +479,14 @@ print_banner_plain() {
 }
 
 truecolor_enabled() {
-  [[ -n "${COLORTERM:-}" ]] && [[ "$COLORTERM" == "truecolor" || "$COLORTERM" == "24bit" ]]
+  case "${COLORTERM:-}" in
+    truecolor | 24bit)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
 }
 
 ansi_palette_level() {
@@ -1119,8 +1129,9 @@ plan_config_dir() {
 }
 
 is_server_root_dir() {
-  case "$1" in
-    "$HOME/.vscode-server" | "$HOME/.vscode-server/" | "$HOME/.vscode-server-insiders" | "$HOME/.vscode-server-insiders/")
+  local path="${1%/}"
+  case "$path" in
+    "$HOME/.vscode-server" | "$HOME/.vscode-server-insiders")
       return 0
       ;;
     *)
@@ -1921,20 +1932,24 @@ parse_args() {
     TARGET="all"
     ACTION=${ACTION:-analyze}
   else
-    if [[ ${POSITIONALS[0]} == extensions || ${POSITIONALS[0]} == caches || ${POSITIONALS[0]} == hosts || ${POSITIONALS[0]} == all ]]; then
-      set_target "${POSITIONALS[0]}"
-      if ((${#POSITIONALS[@]} > 1)); then
-        set_action "${POSITIONALS[1]}"
-      fi
-    elif [[ ${POSITIONALS[0]} == analyze || ${POSITIONALS[0]} == clean ]]; then
-      if ((${#POSITIONALS[@]} > 1)); then
-        err "Target must come before action (use: vscode-broom [target] [action])"
-      fi
-      set_action "${POSITIONALS[0]}"
-      TARGET=${TARGET:-all}
-    else
-      err "Unexpected argument: ${POSITIONALS[0]}"
-    fi
+    case "${POSITIONALS[0]}" in
+      extensions | caches | hosts | all)
+        set_target "${POSITIONALS[0]}"
+        if ((${#POSITIONALS[@]} > 1)); then
+          set_action "${POSITIONALS[1]}"
+        fi
+        ;;
+      analyze | clean)
+        if ((${#POSITIONALS[@]} > 1)); then
+          err "Target must come before action (use: vscode-broom [target] [action])"
+        fi
+        set_action "${POSITIONALS[0]}"
+        TARGET=${TARGET:-all}
+        ;;
+      *)
+        err "Unexpected argument: ${POSITIONALS[0]}"
+        ;;
+    esac
 
     if ((${#POSITIONALS[@]} > 2)); then
       err "Too many arguments: ${POSITIONALS[*]}"
