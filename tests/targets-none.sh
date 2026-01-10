@@ -81,24 +81,27 @@ run_cmd() {
 }
 
 echo "TAP version 13"
-echo "1..15"
+echo "1..18"
 
 run_cmd "runs hosts analyze with empty HOME" "$ROOT/bin/vscode-broom" hosts
 expect_match "hosts prints section message" "^Server build: none found under known roots\\.$"
 expect_match "hosts prints Summary section" "^Summary:$"
 expect_match "hosts prints empty summary message" "No server build data found under known roots\\.$"
+expect_no_match "hosts does not print reclaimable summary" "^  Reclaimable \\(est\\.\\):"
 expect_no_match "hosts does not print other sections" "^(Extension|Cache & Log)$"
 
 run_cmd "runs extensions analyze with empty HOME" "$ROOT/bin/vscode-broom" extensions
 expect_match "extensions prints section message" "^Extension: none found under known roots\\.$"
 expect_match "extensions prints Summary section" "^Summary:$"
 expect_match "extensions prints empty summary message" "No extension data found under known roots\\.$"
+expect_no_match "extensions does not print reclaimable summary" "^  Reclaimable \\(est\\.\\):"
 expect_no_match "extensions does not print other sections" "^(Server build|Cache & Log)$"
 
 run_cmd "runs caches analyze with empty HOME" "$ROOT/bin/vscode-broom" caches
 expect_match "caches prints section message" "^Cache & Log: none found under known roots\\.$"
 expect_match "caches prints Summary section" "^Summary:$"
 expect_match "caches prints empty summary message" "No cache/log data found under known roots\\.$"
+expect_no_match "caches does not print reclaimable summary" "^  Reclaimable \\(est\\.\\):"
 expect_no_match "caches does not print other sections" "^(Server build|Extension)$"
 
 exit "$FAILURES"
