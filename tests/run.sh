@@ -25,12 +25,17 @@ require_test_deps() {
   done
 }
 
+load_tests() {
+  find "$ROOT/tests" -maxdepth 1 -type f -name '*.sh' ! -name 'run.sh' | sort
+}
+
 require_test_deps
+declare -a tests=()
+mapfile -t tests < <(load_tests)
 
 if command -v prove > /dev/null 2>&1; then
   args=()
   "$VERBOSE" && args+=("-v")
-  mapfile -t tests < <(find "$ROOT/tests" -maxdepth 1 -type f -name '*.sh' ! -name 'run.sh' | sort)
   if prove "${args[@]}" "${tests[@]}"; then
     exit 0
   fi
@@ -42,8 +47,6 @@ if command -v prove > /dev/null 2>&1; then
   fi
   exit "$status"
 fi
-
-mapfile -t tests < <(find "$ROOT/tests" -maxdepth 1 -type f -name '*.sh' ! -name 'run.sh' | sort)
 
 passed=0
 failed=0
