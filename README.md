@@ -105,6 +105,7 @@ Color is enabled only when supported and `NO_COLOR` is not set.
 - Run all tests (TAP): `./tests/run.sh`
 - Include captured CLI output: `./tests/run.sh -v`
 - Individual tests: see `tests/README.md`
+- Command-level argument validation: `tests/command-errors.sh`
 
 ## License
 
